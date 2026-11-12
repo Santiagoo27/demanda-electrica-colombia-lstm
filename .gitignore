@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Modelos entrenados
+*.keras
+*.h5
+
+# Manuscrito en revisión, borradores y formularios de la revista: solo locales
+manuscript/
+
+# Archivos locales del autor
+CLAUDE.md
+.claude/
+
+# Sistema
+Thumbs.db
+desktop.ini
+.DS_Store
+~$*
+
+# No se publican figuras, tablas ni resultados (están en el artículo en revisión;
+# ver autorización firmada con Uninorte). Se regeneran localmente con los scripts.
+figures/
+results/
+archive/
+docs/PENDIENTES.md
+docs/diccionariodatos.xlsx
+# Script de diagnóstico frente a la versión antigua (contiene sus cifras): solo local
+src/diagnostico_demanda.py

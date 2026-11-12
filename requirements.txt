@@ -1,0 +1,8 @@
+# Python 3.13.5
+# Versiones registradas por modelo_final.py en results/final/config.json:
+numpy==2.3.3
+pandas==2.3.3
+tensorflow==2.20.0
+# Versiones instaladas en el equipo del autor al organizar el repo (no las registró la corrida final):
+scikit-learn==1.7.2
+matplotlib==3.10.6
