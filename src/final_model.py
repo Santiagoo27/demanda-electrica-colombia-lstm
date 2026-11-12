@@ -1,29 +1,29 @@
 """
-modelo_final.py
-===============
-Experimento completo del artículo: LSTM para el pronóstico horario de la demanda eléctrica de
-Colombia, con ablación de variables y baselines, en una sola ejecución reproducible.
+final_model.py
+==============
+Full experiment of the article: LSTM for hourly electricity demand forecasting in Colombia,
+with input ablation and baselines, in a single reproducible run.
 
-  - Los MinMaxScaler se ajustan SOLO con las filas usadas en el entrenamiento (sin fuga de datos).
-  - Semillas fijas, varias por configuración (se reporta media y desviación estándar).
-  - Ablación: modelo completo, sin solar/wind, sin lags, sin codificación cíclica.
-  - Baselines (persistencia, seasonal naive, gradient boosting) con la misma información que el LSTM.
-  - Métricas en MW y en escala normalizada calculadas de la misma corrida.
-  - Los objetivos de test con demanda 0 (las últimas 24 filas del archivo, fechadas 2015-01-01)
-    son datos faltantes y se excluyen de todas las métricas. Las predicciones completas se
-    guardan igualmente en corridas/*.npz, junto con la máscara "valido".
-  - Guarda cada corrida al terminar: si se interrumpe, al volver a ejecutar continúa donde quedó.
+  - The MinMaxScalers are fitted ONLY on the rows used for training (no data leakage).
+  - Fixed seeds, several per configuration (mean and standard deviation are reported).
+  - Ablation: full model, without solar/wind, without demand lags, without cyclic encodings.
+  - Baselines (persistence, seasonal naive, gradient boosting) with the same information as the LSTM.
+  - Metrics in MW and on the normalised scale are computed from the same run.
+  - Test targets with zero demand (the last 24 rows of the file, dated 2015-01-01) are missing
+    data and are excluded from every metric. The full predictions are still saved in
+    runs/*.npz, together with the "valid" mask.
+  - Each run is saved as soon as it finishes: if interrupted, re-running resumes where it stopped.
 
-Arquitectura: LSTM 128 + Dropout 0.2 + LSTM 64 + BatchNormalization + Dense 32 + Dense 1,
-Adam 0.001, 80 épocas, lote 32, validation_split 0.2, ventana de 72 h.
+Architecture: LSTM 128 + Dropout 0.2 + LSTM 64 + BatchNormalization + Dense 32 + Dense 1,
+Adam 0.001, 80 epochs, batch 32, validation_split 0.2, 72-hour window.
 
-Uso:
-  python src/modelo_final.py          (por defecto: --ruta data/raw, --salida results/nueva_corrida)
-  python src/modelo_final.py --seeds 1 --epochs 3 --salida <ruta absoluta>   (prueba rápida)
-  python src/modelo_final.py --solo-baselines                                (solo baselines, ~1 minuto)
-  python src/modelo_final.py --n-filas 8760                                  (recorta a 8,760 filas)
+Usage:
+  python src/final_model.py          (defaults: --data-dir data/raw, --output results/new_run)
+  python src/final_model.py --seeds 1 --epochs 3 --output <absolute path>   (quick test)
+  python src/final_model.py --baselines-only                                (baselines only, ~1 minute)
+  python src/final_model.py --n-rows 8760                                   (truncate to 8,760 rows)
 
-Resultados: carpeta <ruta>/<salida> (una --salida absoluta se usa tal cual). El resumen queda en resumen.txt.
+Results: folder <data-dir>/<output> (an absolute --output is used as is). Summary in summary.txt.
 """
 import argparse
 import json
@@ -47,13 +47,13 @@ except Exception:
     pass
 
 # ----------------------------------------------------------------------------
-# CONFIGURACIÓN
+# CONFIGURATION
 # ----------------------------------------------------------------------------
-# Rutas por defecto relativas al repositorio
+# Default paths, relative to the repository
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUTA_DEFECTO = os.path.join(_REPO, "data", "raw")
-# results/final guarda la corrida verificada del manuscrito; las corridas nuevas van a otra carpeta
-SALIDA_DEFECTO = os.path.join(_REPO, "results", "nueva_corrida")
+DEFAULT_DATA_DIR = os.path.join(_REPO, "data", "raw")
+# New runs go to their own folder so that earlier results are never overwritten
+DEFAULT_OUTPUT = os.path.join(_REPO, "results", "new_run")
 FILE_SOLAR = "4. Solar_generation_ENSO-NINO.txt"
 FILE_WIND = "6. Wind_generation_ENSO-NINO.txt"
 FILE_DEMAND = "Electricity demand Colombia 2014 [MW].txt"
@@ -63,40 +63,40 @@ BATCH = 32
 VAL_SPLIT = 0.2
 LR = 0.001
 
-CICLICAS = ["hour_sin", "hour_cos", "day_sin", "day_cos", "year_sin", "year_cos"]
+CYCLIC = ["hour_sin", "hour_cos", "day_sin", "day_cos", "year_sin", "year_cos"]
 LAGS = ["demand_lag_1", "demand_lag_24", "demand_lag_168"]
-ALL = ["solar", "wind"] + CICLICAS + ["is_weekend", "is_working_hour"] + LAGS
+ALL = ["solar", "wind"] + CYCLIC + ["is_weekend", "is_working_hour"] + LAGS
 
-# clave -> (etiqueta, variables)
+# key -> (label, input variables)
 CONFIGS = {
-    "completo": ("Completo (13 variables)", ALL),
-    "sin_solar_wind": ("Sin solar ni wind (11)", [f for f in ALL if f not in ("solar", "wind")]),
-    "sin_lags": ("Sin lags de demanda (10)", [f for f in ALL if f not in LAGS]),
-    "sin_ciclicas": ("Sin codificación cíclica (7)", [f for f in ALL if f not in CICLICAS]),
+    "full": ("Full model (13 variables)", ALL),
+    "no_solar_wind": ("Without solar and wind (11)", [f for f in ALL if f not in ("solar", "wind")]),
+    "no_lags": ("Without demand lags (10)", [f for f in ALL if f not in LAGS]),
+    "no_cyclic": ("Without cyclic encodings (7)", [f for f in ALL if f not in CYCLIC]),
 }
+# Configuration keys used by earlier (Spanish) versions of this script
+LEGACY_KEYS = {"completo": "full", "sin_solar_wind": "no_solar_wind",
+               "sin_lags": "no_lags", "sin_ciclicas": "no_cyclic"}
 
 
 # ----------------------------------------------------------------------------
-# Datos y features
+# Data and features
 # ----------------------------------------------------------------------------
-def load_data(ruta, f_solar, f_wind, f_demand, n_filas=None):
-    solar = pd.read_csv(os.path.join(ruta, f_solar), header=None, names=["solar"])
-    wind = pd.read_csv(os.path.join(ruta, f_wind), header=None, names=["wind"])
-    demand = pd.read_csv(os.path.join(ruta, f_demand), header=None, names=["demand"])
-    print(f"Archivos: solar={f_solar} | wind={f_wind} | demanda={f_demand}")
-    print(f"Filas leídas: solar={len(solar)}, wind={len(wind)}, demanda={len(demand)}")
+def load_data(data_dir, f_solar, f_wind, f_demand, n_rows=None):
+    solar = pd.read_csv(os.path.join(data_dir, f_solar), header=None, names=["solar"])
+    wind = pd.read_csv(os.path.join(data_dir, f_wind), header=None, names=["wind"])
+    demand = pd.read_csv(os.path.join(data_dir, f_demand), header=None, names=["demand"])
+    print(f"Files: solar={f_solar} | wind={f_wind} | demand={f_demand}")
+    print(f"Rows read: solar={len(solar)}, wind={len(wind)}, demand={len(demand)}")
     n = min(len(solar), len(wind), len(demand))
-    if n_filas:
-        n = min(n, n_filas)
+    if n_rows:
+        n = min(n, n_rows)
     if n != 8760:
-        print(f"AVISO: se usan {n} filas, y 2014 tiene 8,760 horas. Las filas sobrantes quedan fechadas en 2015.")
+        print(f"NOTE: using {n} rows, while 2014 has 8,760 hours. The extra rows are dated 2015.")
     data = pd.concat([solar[:n], wind[:n], demand[:n]], axis=1)
     data.index = pd.date_range(start="2014-01-01", periods=len(data), freq="60min")
     d = data["demand"].values
-    print(f"Demanda: mín={d.min():.0f} MW, máx={d.max():.0f} MW, media={d.mean():.0f} MW, ceros={int((d == 0).sum())}")
-    if len(d) >= 48:
-        print(f"Últimas 24 filas vs. las 24 anteriores: correlación={np.corrcoef(d[-24:], d[-48:-24])[0, 1]:.3f}, "
-              f"idénticas={bool(np.allclose(d[-24:], d[-48:-24]))}")
+    print(f"Demand: min={d.min():.0f} MW, max={d.max():.0f} MW, mean={d.mean():.0f} MW, zeros={int((d == 0).sum())}")
 
     data["hour"] = data.index.hour
     data["day_of_week"] = data.index.dayofweek
@@ -117,7 +117,7 @@ def load_data(ruta, f_solar, f_wind, f_demand, n_filas=None):
 
 
 def split_info(n_rows):
-    """Secuencias de SEQ_LEN filas y partición cronológica 80/20. t = fila del objetivo."""
+    """Sequences of SEQ_LEN rows and chronological 80/20 split. t = row of the target."""
     n_seq = n_rows - SEQ_LEN
     split = int(0.8 * n_seq)
     train_t = np.arange(SEQ_LEN, split + SEQ_LEN)
@@ -126,7 +126,7 @@ def split_info(n_rows):
 
 
 def valid_test(data):
-    """Máscara de los objetivos de test válidos (demanda > 0; los ceros son datos faltantes)."""
+    """Mask of the valid test targets (demand > 0; zeros are missing data)."""
     _, _, _, test_t = split_info(len(data))
     return data["demand"].values[test_t] > 0
 
@@ -149,20 +149,20 @@ def run_baselines(data, out):
     d = data["demand"].values
     y_test = d[test_t]
     rows = {
-        "Persistencia (última demanda conocida, t-2)": metrics_mw(y_test, d[test_t - 2]),
+        "Persistence (last known demand, t-2)": metrics_mw(y_test, d[test_t - 2]),
         "Seasonal naive 24 h (t-24)": metrics_mw(y_test, d[test_t - 24]),
         "Seasonal naive 168 h (t-168)": metrics_mw(y_test, d[test_t - 168]),
     }
     for name, cols in [
         ("Gradient boosting, 13 variables", ALL),
-        ("Gradient boosting, sin solar ni wind (11)", CONFIGS["sin_solar_wind"][1]),
+        ("Gradient boosting, without solar and wind (11)", CONFIGS["no_solar_wind"][1]),
     ]:
         X = data[cols].values
         gb = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.05, random_state=0)
         gb.fit(X[train_t - 1], d[train_t])
         rows[name] = metrics_mw(y_test, gb.predict(X[test_t - 1]))
     table = pd.DataFrame(rows).T
-    table.index.name = "modelo"
+    table.index.name = "model"
     table.round(3).to_csv(os.path.join(out, "baselines.csv"), encoding="utf-8-sig")
     return table
 
@@ -173,9 +173,9 @@ def run_baselines(data, out):
 def prepare(data, cols):
     n_rows = len(data)
     n_seq, split, _, _ = split_info(n_rows)
-    fit_end = split + SEQ_LEN  # filas vistas en el entrenamiento (entradas y objetivos)
+    fit_end = split + SEQ_LEN  # rows seen during training (inputs and targets)
     sx, sy = MinMaxScaler(), MinMaxScaler()
-    sx.fit(data[cols].iloc[:fit_end])                  # SOLO entrenamiento
+    sx.fit(data[cols].iloc[:fit_end])                  # training rows ONLY
     sy.fit(data[["demand"]].iloc[:fit_end])
     xs = sx.transform(data[cols])
     ys = sy.transform(data[["demand"]]).ravel()
@@ -222,45 +222,45 @@ def train_one(data, key, seed, epochs, out):
         "MSE_norm": float(np.mean(e ** 2)),
         "RMSE_norm": float(np.sqrt(np.mean(e ** 2))),
         "MAE_norm": float(np.mean(np.abs(e))),
-        "MAE_pct_media": float(100 * m["MAE_MW"] / np.mean(real[ok])),
-        "segundos": round(time.time() - t0, 1),
+        "MAE_pct_mean": float(100 * m["MAE_MW"] / np.mean(real[ok])),
+        "seconds": round(time.time() - t0, 1),
     })
-    np.savez(os.path.join(out, "corridas", f"{key}_semilla{seed}.npz"),
-             real=real, pred=pred, valido=ok,
+    np.savez(os.path.join(out, "runs", f"{key}_seed{seed}.npz"),
+             real=real, pred=pred, valid=ok,
              loss=np.array(hist.history["loss"]), val_loss=np.array(hist.history["val_loss"]))
     return label, m
 
 
 # ----------------------------------------------------------------------------
-# Resumen, tablas y figuras
+# Summary, tables and figures
 # ----------------------------------------------------------------------------
 def postprocess(data, out, baselines, args):
-    csv = os.path.join(out, "metricas_por_semilla.csv")
+    csv = os.path.join(out, "metrics_per_seed.csv")
     if not os.path.exists(csv):
         return None
     df = pd.read_csv(csv)
     order = [CONFIGS[k][0] for k in CONFIGS if CONFIGS[k][0] in set(df["config"])]
-    cols = ["MAE_MW", "RMSE_MW", "R2", "MSE_norm", "RMSE_norm", "MAE_norm", "MAE_pct_media"]
+    cols = ["MAE_MW", "RMSE_MW", "R2", "MSE_norm", "RMSE_norm", "MAE_norm", "MAE_pct_mean"]
     g = df.groupby("config")[cols].agg(["mean", "std"]).reindex(order)
     g.columns = [f"{a}_{b}" for a, b in g.columns]
-    g["n_semillas"] = df.groupby("config").size().reindex(order)
-    g.round(4).to_csv(os.path.join(out, "resumen_lstm.csv"), encoding="utf-8-sig")
+    g["n_seeds"] = df.groupby("config").size().reindex(order)
+    g.round(4).to_csv(os.path.join(out, "lstm_summary.csv"), encoding="utf-8-sig")
 
     comp = []
     for lab in order:
         r = g.loc[lab]
-        comp.append({"modelo": "LSTM: " + lab,
+        comp.append({"model": "LSTM: " + lab,
                      "MAE_MW": r["MAE_MW_mean"], "MAE_std": r["MAE_MW_std"],
                      "RMSE_MW": r["RMSE_MW_mean"], "RMSE_std": r["RMSE_MW_std"],
                      "R2": r["R2_mean"], "R2_std": r["R2_std"]})
     for name, r in baselines.iterrows():
-        comp.append({"modelo": name, "MAE_MW": r["MAE_MW"], "MAE_std": np.nan,
+        comp.append({"model": name, "MAE_MW": r["MAE_MW"], "MAE_std": np.nan,
                      "RMSE_MW": r["RMSE_MW"], "RMSE_std": np.nan, "R2": r["R2"], "R2_std": np.nan})
     comp = pd.DataFrame(comp)
-    comp.round(3).to_csv(os.path.join(out, "tabla_comparacion.csv"), index=False, encoding="utf-8-sig")
+    comp.round(3).to_csv(os.path.join(out, "comparison_table.csv"), index=False, encoding="utf-8-sig")
 
-    # Figura: curvas de pérdida (modelo completo, semilla 0)
-    f0 = os.path.join(out, "corridas", "completo_semilla0.npz")
+    # Figure: loss curves and prediction (full model, seed 0)
+    f0 = os.path.join(out, "runs", "full_seed0.npz")
     if os.path.exists(f0):
         z = np.load(f0)
         plt.figure(figsize=(10, 4))
@@ -272,7 +272,7 @@ def postprocess(data, out, baselines, args):
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(os.path.join(out, "curvas_perdida.png"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join(out, "loss_curves.png"), dpi=300, bbox_inches="tight")
         plt.close()
 
         plt.figure(figsize=(12, 5))
@@ -283,12 +283,12 @@ def postprocess(data, out, baselines, args):
         plt.xlabel("Hours")
         plt.ylabel("Demand (MW)")
         plt.tight_layout()
-        plt.savefig(os.path.join(out, "demanda_prediccion.png"), dpi=300, bbox_inches="tight")
+        plt.savefig(os.path.join(out, "demand_prediction.png"), dpi=300, bbox_inches="tight")
         plt.close()
 
-    # Figura: ablación
+    # Figure: ablation
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    for ax, col, ttl in zip(axes, ["R2", "RMSE_MW"], ["R² (media ± desv.)", "RMSE en MW (media ± desv.)"]):
+    for ax, col, ttl in zip(axes, ["R2", "RMSE_MW"], ["R² (mean ± SD)", "RMSE in MW (mean ± SD)"]):
         ax.bar(range(len(order)), g[f"{col}_mean"].values, yerr=g[f"{col}_std"].fillna(0).values, capsize=4,
                color="steelblue")
         ax.set_xticks(range(len(order)))
@@ -296,7 +296,7 @@ def postprocess(data, out, baselines, args):
         ax.set_title(ttl)
         ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(out, "ablacion.png"), dpi=200, bbox_inches="tight")
+    plt.savefig(os.path.join(out, "ablation.png"), dpi=200, bbox_inches="tight")
     plt.close()
     return g, comp, df
 
@@ -305,97 +305,102 @@ def write_summary(out, data, args, baselines, post, versions):
     n_rows = len(data)
     _, _, train_t, test_t = split_info(n_rows)
     lines = []
-    lines.append("RESUMEN (modelo_final.py)")
+    lines.append("SUMMARY (final_model.py)")
     lines.append("=" * 60)
-    lines.append(f"Archivos: solar={args.solar} | wind={args.wind} | demanda={args.demand}")
-    lines.append(f"Filas usadas tras dropna: {n_rows} | entrenamiento: {len(train_t)} | test: {len(test_t)}")
-    lines.append(f"Periodo de test: {data.index[test_t[0]]} -> {data.index[test_t[-1]]}")
+    lines.append(f"Files: solar={args.solar} | wind={args.wind} | demand={args.demand}")
+    lines.append(f"Rows after dropna: {n_rows} | training: {len(train_t)} | test: {len(test_t)}")
+    lines.append(f"Test period: {data.index[test_t[0]]} -> {data.index[test_t[-1]]}")
     ok = valid_test(data)
-    lines.append(f"Objetivos de test evaluados (demanda > 0): {ok.sum()} de {len(test_t)} "
-                 f"(hasta {data.index[test_t[ok][-1]]})")
-    lines.append(f"Semillas: {args.seeds} | épocas: {args.epochs} | lote: {BATCH} | ventana: {SEQ_LEN} h")
-    lines.append(f"Versiones: {json.dumps(versions, ensure_ascii=False)}")
+    lines.append(f"Test targets evaluated (demand > 0): {ok.sum()} of {len(test_t)} "
+                 f"(up to {data.index[test_t[ok][-1]]})")
+    lines.append(f"Seeds: {args.seeds} | epochs: {args.epochs} | batch: {BATCH} | window: {SEQ_LEN} h")
+    lines.append(f"Versions: {json.dumps(versions, ensure_ascii=False)}")
     lines.append("")
     lines.append("BASELINES (MW)")
     lines.append(baselines.round(3).to_string())
     if post is not None:
         g, comp, df = post
         lines.append("")
-        lines.append("LSTM, media y desviación por configuración")
+        lines.append("LSTM, mean and standard deviation per configuration")
         lines.append(g.round(4).to_string())
         lines.append("")
-        lines.append("TABLA DE COMPARACIÓN")
+        lines.append("COMPARISON TABLE")
         lines.append(comp.round(3).to_string(index=False))
         lines.append("")
-        lines.append("MÉTRICAS POR SEMILLA")
+        lines.append("METRICS PER SEED")
         lines.append(df.round(4).to_string(index=False))
     txt = "\n".join(lines)
-    with open(os.path.join(out, "resumen.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out, "summary.txt"), "w", encoding="utf-8") as f:
         f.write(txt)
     return txt
 
 
 # ----------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ruta", default=RUTA_DEFECTO)
+    ap = argparse.ArgumentParser(description="LSTM ablation experiment and baselines.")
+    # Spanish option names from earlier versions are kept as aliases
+    ap.add_argument("--data-dir", "--ruta", dest="data_dir", default=DEFAULT_DATA_DIR,
+                    help="folder with the .txt data files")
     ap.add_argument("--solar", default=FILE_SOLAR)
     ap.add_argument("--wind", default=FILE_WIND)
     ap.add_argument("--demand", default=FILE_DEMAND)
-    ap.add_argument("--seeds", type=int, default=5, help="semillas por configuración")
+    ap.add_argument("--seeds", type=int, default=5, help="seeds per configuration")
     ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--n-filas", type=int, default=None, help="recorta los archivos a N filas (p. ej. 8760)")
-    ap.add_argument("--configs", default=",".join(CONFIGS), help="claves separadas por coma")
-    ap.add_argument("--solo-baselines", action="store_true")
-    ap.add_argument("--salida", default=SALIDA_DEFECTO)
+    ap.add_argument("--n-rows", "--n-filas", dest="n_rows", type=int, default=None,
+                    help="truncate the files to N rows (e.g. 8760)")
+    ap.add_argument("--configs", default=",".join(CONFIGS), help="comma-separated configuration keys")
+    ap.add_argument("--baselines-only", "--solo-baselines", dest="baselines_only", action="store_true")
+    ap.add_argument("--output", "--salida", dest="output", default=DEFAULT_OUTPUT,
+                    help="output folder (a relative path is taken relative to --data-dir)")
     args = ap.parse_args()
 
-    out = os.path.join(args.ruta, args.salida)
-    os.makedirs(os.path.join(out, "corridas"), exist_ok=True)
+    out = os.path.join(args.data_dir, args.output)
+    os.makedirs(os.path.join(out, "runs"), exist_ok=True)
 
-    data = load_data(args.ruta, args.solar, args.wind, args.demand, args.n_filas)
+    data = load_data(args.data_dir, args.solar, args.wind, args.demand, args.n_rows)
     _, _, train_t, test_t = split_info(len(data))
-    print(f"Entrenamiento: {len(train_t)} objetivos | Test: {len(test_t)} objetivos")
-    print(f"Periodo de test: {data.index[test_t[0]]} -> {data.index[test_t[-1]]}")
+    print(f"Training: {len(train_t)} targets | Test: {len(test_t)} targets")
+    print(f"Test period: {data.index[test_t[0]]} -> {data.index[test_t[-1]]}")
 
     versions = {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__}
     baselines = run_baselines(data, out)
     print("\n=== Baselines (MW) ===")
     print(baselines.round(3).to_string())
 
-    csv = os.path.join(out, "metricas_por_semilla.csv")
-    if not args.solo_baselines:
+    csv = os.path.join(out, "metrics_per_seed.csv")
+    if not args.baselines_only:
         try:
             import tensorflow as tf
             versions["tensorflow"] = tf.__version__
         except ImportError:
-            sys.exit("No se encontró TensorFlow. Usa --solo-baselines o instala TensorFlow.")
-        keys = [k.strip() for k in args.configs.split(",") if k.strip() in CONFIGS]
+            sys.exit("TensorFlow not found. Use --baselines-only or install TensorFlow.")
+        requested = [LEGACY_KEYS.get(k.strip(), k.strip()) for k in args.configs.split(",")]
+        keys = [k for k in requested if k in CONFIGS]
         done = set()
         if os.path.exists(csv):
             prev = pd.read_csv(csv)
-            done = set(zip(prev["clave"], prev["seed"]))
+            done = set(zip(prev["key"], prev["seed"]))
         total = len(keys) * args.seeds
         k = 0
         for seed in range(args.seeds):
             for key in keys:
                 k += 1
                 if (key, seed) in done:
-                    print(f"[{k}/{total}] {key} semilla {seed}: ya existe, se omite")
+                    print(f"[{k}/{total}] {key} seed {seed}: already done, skipped")
                     continue
                 label, m = train_one(data, key, seed, args.epochs, out)
-                row = {"clave": key, "config": label, "seed": seed, **m}
+                row = {"key": key, "config": label, "seed": seed, **m}
                 pd.DataFrame([row]).to_csv(csv, mode="a", header=not os.path.exists(csv),
                                            index=False, encoding="utf-8-sig")
-                print(f"[{k}/{total}] {label} | semilla {seed}: MAE={m['MAE_MW']:.1f} MW  "
-                      f"RMSE={m['RMSE_MW']:.1f} MW  R2={m['R2']:.3f}  ({m['segundos']} s)")
+                print(f"[{k}/{total}] {label} | seed {seed}: MAE={m['MAE_MW']:.1f} MW  "
+                      f"RMSE={m['RMSE_MW']:.1f} MW  R2={m['R2']:.3f}  ({m['seconds']} s)")
 
     post = postprocess(data, out, baselines, args)
-    json.dump({"args": vars(args), "versions": versions, "filas": len(data)},
+    json.dump({"args": vars(args), "versions": versions, "rows": len(data)},
               open(os.path.join(out, "config.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     txt = write_summary(out, data, args, baselines, post, versions)
     print("\n" + txt)
-    print(f"\nListo. Archivos en: {out}")
+    print(f"\nDone. Files in: {out}")
 
 
 if __name__ == "__main__":

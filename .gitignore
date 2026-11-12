@@ -5,29 +5,29 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 
-# Modelos entrenados
+# Trained models
 *.keras
 *.h5
 
-# Manuscrito en revisión, borradores y formularios de la revista: solo locales
+# Manuscript under review, drafts and journal forms: local only
 manuscript/
 
-# Archivos locales del autor
+# Author's local files
 CLAUDE.md
 .claude/
 
-# Sistema
+# System
 Thumbs.db
 desktop.ini
 .DS_Store
 ~$*
 
-# No se publican figuras, tablas ni resultados (están en el artículo en revisión;
-# ver autorización firmada con Uninorte). Se regeneran localmente con los scripts.
+# Figures, tables and results are not published (they belong to the article under review).
+# They are regenerated locally by the scripts.
 figures/
 results/
 archive/
 docs/PENDIENTES.md
 docs/diccionariodatos.xlsx
-# Script de diagnóstico frente a la versión antigua (contiene sus cifras): solo local
+# Diagnostic script for the earlier version (contains its figures): local only
 src/diagnostico_demanda.py
